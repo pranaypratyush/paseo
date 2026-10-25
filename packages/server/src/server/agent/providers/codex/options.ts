@@ -1,5 +1,6 @@
 import type { ProviderOptions, ToolPolicy } from "@getpaseo/protocol/agent-types";
 import { z } from "zod";
+import { NativeObservationOptionsSchema } from "../native-observation.js";
 
 const ApprovalPolicySchema = z.union([
   z.enum(["untrusted", "on-request", "never"]),
@@ -38,6 +39,7 @@ const NetworkPolicySchema = z
 export const CodexProviderOptionsSchema = z
   .object({
     approval_policy: ApprovalPolicySchema.optional(),
+    nativeSchemaObservation: NativeObservationOptionsSchema.optional(),
     sandbox_mode: z.enum(["read-only", "workspace-write", "danger-full-access"]).optional(),
     sandbox_workspace_write: z
       .object({

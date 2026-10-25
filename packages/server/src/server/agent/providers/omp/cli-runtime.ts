@@ -10,6 +10,8 @@ import {
   type JsonlRpcLaunch,
 } from "../jsonl-rpc-process.js";
 import { establishOmpProtocol } from "./protocol-session.js";
+import { OmpNativeObservation, type OmpNativeObservationOptions } from "./native-observation.js";
+import { OmpQualification } from "./qualification.js";
 import {
   buildOmpLaunch,
   type OmpRuntime,
@@ -56,6 +58,7 @@ export interface OmpCliRuntimeOptions {
   commandsRpcName?: "get_available_commands";
   readyTimeoutMs?: number;
   requestTimeoutMs?: number;
+  nativeSchemaObservation?: OmpNativeObservationOptions;
   spawnProcess?: (launch: OmpRuntimeLaunch) => ChildProcessWithoutNullStreams;
 }
 
@@ -77,6 +80,15 @@ export class OmpCliRuntime implements OmpRuntime {
       session: input,
     });
     launch.env = createExternalProcessEnv(globalThis.process.env, launch.env ?? {});
+    const observationOptions =
+      input.nativeSchemaObservation ?? this.options.nativeSchemaObservation;
+    const qualification = observationOptions?.qualificationRecipe
+      ? await OmpQualification.create(launch)
+      : undefined;
+    if (qualification) input.signal?.throwIfAborted();
+    const nativeObservation = observationOptions
+      ? new OmpNativeObservation(observationOptions, qualification)
+      : undefined;
     const [command, ...args] = launch.argv;
     const processLaunch: JsonlRpcLaunch = {
       command,
@@ -101,7 +113,7 @@ export class OmpCliRuntime implements OmpRuntime {
         requestTimeoutMs: this.options.requestTimeoutMs,
       });
       input.signal?.throwIfAborted();
-      return new OmpCliRuntimeSession(process, this.commandsRpcName, launch.env);
+      return new OmpCliRuntimeSession(process, this.commandsRpcName, launch.env, nativeObservation);
     } catch (error) {
       const startupError = error instanceof Error ? error : new Error(String(error));
       await process.close(startupError);
@@ -120,16 +132,24 @@ class OmpCliRuntimeSession implements OmpRuntimeSession {
     private readonly process: JsonlRpcProcess,
     private readonly commandsRpcName: "get_available_commands",
     private readonly launchEnvironment: Record<string, string>,
+    readonly nativeObservation?: OmpNativeObservation,
   ) {
     process.onMessage((message) => {
       const event = parseOmpRuntimeEvent(message);
-      if (event) {
-        this.emit(event);
-      }
+      if (event) this.dispatchEvent(event);
     });
     process.onExit(({ error }) => {
-      this.emit({ type: "process_exit", error: error.message });
+      this.dispatchEvent({ type: "process_exit", error: error.message });
     });
+  }
+
+  private dispatchEvent(event: OmpRuntimeEvent): void {
+    try {
+      this.nativeObservation?.event(event);
+    } catch {
+      this.nativeObservation?.fail();
+    }
+    this.emit(event);
   }
 
   get environment(): Record<string, string> {
@@ -144,6 +164,7 @@ class OmpCliRuntimeSession implements OmpRuntimeSession {
   }
 
   async prompt({ message, images, streamingBehavior }: OmpPromptInput): Promise<OmpPromptAck> {
+    const observation = this.nativeObservation?.preparePrompt(message) ?? null;
     const { id: requestId, promise } = this.process.startRequest({
       type: "prompt",
       message,
@@ -151,6 +172,7 @@ class OmpCliRuntimeSession implements OmpRuntimeSession {
       ...(streamingBehavior ? { streamingBehavior: streamingBehavior } : {}),
     });
     const ack = OmpPromptAckSchema.parse(await promise) ?? {};
+    this.nativeObservation?.promptAccepted(observation, requestId);
     return { requestId, ...ack };
   }
 
@@ -173,7 +195,12 @@ class OmpCliRuntimeSession implements OmpRuntimeSession {
   }
 
   async getState(): Promise<OmpSessionState> {
-    return OmpSessionStateSchema.parse(await this.request({ type: "get_state" }));
+    if (!this.nativeObservation)
+      return OmpSessionStateSchema.parse(await this.request({ type: "get_state" }));
+    const request = this.process.startRequest({ type: "get_state" });
+    const state = OmpSessionStateSchema.parse(await request.promise);
+    this.nativeObservation.stateReceived(state, request.id);
+    return state;
   }
 
   async setFastMode(enabled: boolean): Promise<{ enabled: boolean; active: boolean }> {
@@ -241,6 +268,15 @@ class OmpCliRuntimeSession implements OmpRuntimeSession {
   }
 
   async setHostTools(tools: OmpRpcHostToolDefinition[]): Promise<string[]> {
+    if (this.nativeObservation) {
+      this.nativeObservation.qualification?.command("set_host_tools");
+      const request = this.process.startRequest(
+        OmpRpcCommandSchema.parse({ type: "set_host_tools", tools }),
+      );
+      const data = OmpHostToolsResultSchema.parse(await request.promise);
+      this.nativeObservation.registered(request.id);
+      return data.toolNames ?? [];
+    }
     const data = OmpHostToolsResultSchema.parse(
       await this.request({ type: "set_host_tools", tools }),
     );
@@ -292,6 +328,7 @@ class OmpCliRuntimeSession implements OmpRuntimeSession {
     id: string,
     response: { value?: string; confirmed?: boolean; cancelled?: boolean },
   ): void {
+    this.nativeObservation?.qualification?.command("extension_ui_response");
     this.process.send({ type: "extension_ui_response", id, ...response });
   }
 
@@ -300,14 +337,17 @@ class OmpCliRuntimeSession implements OmpRuntimeSession {
   }
 
   async close(): Promise<void> {
+    this.nativeObservation?.qualification?.command("close");
     await this.process.close(new Error("OMP RPC session is closed"));
   }
 
   private request(command: OmpRpcCommand, timeoutMs?: number | null): Promise<unknown> {
+    this.nativeObservation?.qualification?.command(command.type);
     return this.process.request(OmpRpcCommandSchema.parse(command), timeoutMs);
   }
 
   private requestStopWork(command: OmpRpcCommand): Promise<void> {
+    this.nativeObservation?.qualification?.command(command.type);
     return this.process.requestStopWork(OmpRpcCommandSchema.parse(command));
   }
 
