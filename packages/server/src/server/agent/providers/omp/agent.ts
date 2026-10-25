@@ -77,12 +77,14 @@ import { materializeProviderImage } from "../provider-image-output.js";
 import { OmpCliRuntime } from "./cli-runtime.js";
 import { listOmpImportableSessions, readOmpImportSessionConfig } from "./session-descriptor.js";
 import type { OmpRuntime, OmpRuntimeSession, OmpStartSessionInput } from "./runtime.js";
+import { assertObservationActor } from "../native-observation.js";
 import { OmpMcpBridge, type OmpBridgedToolIdentity } from "./mcp-bridge.js";
 import type {
   OmpAgentSessionEvent,
   OmpAgentMessage,
   OmpImageContent,
   OmpModel,
+  OmpPromptAck,
   OmpRuntimeEvent,
   OmpSessionState,
   OmpThinkingLevel,
@@ -609,6 +611,7 @@ function createRuntime(
     commandsRpcName: "get_available_commands",
     readyTimeoutMs: providerOptions.readyTimeoutMs,
     requestTimeoutMs: providerOptions.rpcTimeoutMs,
+    nativeSchemaObservation: providerOptions.nativeSchemaObservation,
   });
 }
 
@@ -891,28 +894,16 @@ export class OmpAgentSession implements AgentSession {
       try {
         if (this.runtimeDead) await this.replaceRuntime(this.currentModeId ?? "full");
         if (this.closed) throw new Error("OMP session is closed");
+        this.runtimeSession.nativeObservation?.selectOwnerTurn(
+          turnId,
+          options?.clientMessageId ?? null,
+        );
         const ack = await this.runtimeSession.prompt({
           message: payload.text,
           images: payload.images,
           streamingBehavior,
         });
-        this.activePromptRequestId = ack.requestId ?? null;
-        const correlatedResult = ack.requestId
-          ? this.pendingPromptResults.get(ack.requestId)
-          : undefined;
-        if (ack.requestId) {
-          this.pendingPromptResults.delete(ack.requestId);
-        }
-        this.activePromptAgentInvoked = correlatedResult?.agentInvoked ?? ack.agentInvoked ?? null;
-        this.activePromptError = correlatedResult?.error ?? null;
-        if (correlatedResult?.agentInvoked === false) {
-          this.scheduleNoTurnPromptCompletion(turnId);
-          return;
-        }
-        if (correlatedResult?.agentInvoked !== true && ack.agentInvoked === false) {
-          await this.completeNoTurnPrompt(turnId);
-          return;
-        }
+        await this.acceptPromptAcknowledgement(turnId, ack);
       } catch (error) {
         if (this.activeTurnId !== turnId) {
           return;
@@ -938,6 +929,23 @@ export class OmpAgentSession implements AgentSession {
     })();
 
     return { turnId };
+  }
+
+  private async acceptPromptAcknowledgement(turnId: string, ack: OmpPromptAck): Promise<void> {
+    this.activePromptRequestId = ack.requestId ?? null;
+    const correlatedResult = ack.requestId
+      ? this.pendingPromptResults.get(ack.requestId)
+      : undefined;
+    if (ack.requestId) this.pendingPromptResults.delete(ack.requestId);
+    this.activePromptAgentInvoked = correlatedResult?.agentInvoked ?? ack.agentInvoked ?? null;
+    this.activePromptError = correlatedResult?.error ?? null;
+    if (correlatedResult?.agentInvoked === false) {
+      this.scheduleNoTurnPromptCompletion(turnId);
+      return;
+    }
+    if (correlatedResult?.agentInvoked !== true && ack.agentInvoked === false) {
+      await this.completeNoTurnPrompt(turnId);
+    }
   }
 
   async steerActiveTurn(
@@ -2149,7 +2157,13 @@ export class OmpAgentSession implements AgentSession {
       });
       return;
     }
-    const errorMessage = latestOmpErrorMessage(messages);
+    if (this.runtimeSession.nativeObservation?.outcome(turnId) === "pending") {
+      void this.completeTurnAfterProviderIdle(turnId, messages, this.activeTurnStarted);
+      return;
+    }
+    const errorMessage =
+      this.runtimeSession.nativeObservation?.failureForOwner(turnId) ??
+      latestOmpErrorMessage(messages);
     if (typeof errorMessage === "string" && errorMessage.length > 0) {
       this.usagePoller.stopTurn();
       this.resetActiveTurn({ terminalizeWork: true });
@@ -2174,9 +2188,11 @@ export class OmpAgentSession implements AgentSession {
   private async completeTurnAfterProviderIdle(
     turnId: string | undefined,
     messages: OmpAgentMessage[],
+    waitForProviderIdle = true,
   ): Promise<void> {
     const deadline = Date.now() + this.providerIdleDeadlineMs;
-    while (!this.closed && this.activeTurnStarted && this.currentTurnIdForEvent() === turnId) {
+    while (!this.closed && this.currentTurnIdForEvent() === turnId) {
+      if (waitForProviderIdle && !this.activeTurnStarted) return;
       if (Date.now() >= deadline) {
         this.usagePoller.stopTurn();
         this.resetActiveTurn({ terminalizeWork: true });
@@ -2186,6 +2202,15 @@ export class OmpAgentSession implements AgentSession {
           turnId,
           error: "OMP provider idle deadline exceeded",
         });
+        return;
+      }
+      const observation = this.runtimeSession.nativeObservation?.outcome(turnId);
+      if (observation === "pending") {
+        await this.providerIdleScheduler.waitForRetry();
+        continue;
+      }
+      if (observation === "failed" || !waitForProviderIdle) {
+        this.completeTurn(turnId, messages);
         return;
       }
       try {
@@ -2265,6 +2290,7 @@ export class OmpAgentClient implements AgentClient {
     const router = new OmpHostToolRouter({ runtimeSession, catalog, bridge, logger: this.logger });
     try {
       await router.register();
+      runtimeSession.nativeObservation?.setMappings(bridge.toolIdentities());
       return router;
     } catch (error) {
       await router.close();
@@ -2300,9 +2326,10 @@ export class OmpAgentClient implements AgentClient {
       systemPrompt: composeSystemPromptParts(config.systemPrompt, config.daemonAppendSystemPrompt),
       env: launchContext?.env,
     };
-    const runtimeSession = await this.resolveRuntime(config.providerOptions).startSession(
-      startInput,
-    );
+    const runtimeSession = await this.resolveRuntime(
+      config.providerOptions,
+      launchContext?.agentId,
+    ).startSession(startInput);
     let hostTools: OmpHostToolRouter | undefined;
     try {
       hostTools = await this.configureNativePaseoTools(
@@ -2373,6 +2400,7 @@ export class OmpAgentClient implements AgentClient {
     });
     const runtimeSession = await this.resolveRuntime(
       resumeConfig.config.providerOptions,
+      launchContext?.agentId,
     ).startSession(startInput);
     let hostTools: OmpHostToolRouter | undefined;
     try {
@@ -2446,7 +2474,10 @@ export class OmpAgentClient implements AgentClient {
   ): OmpAgentSessionOptions["restartRuntime"] {
     return async (sessionFile, modeId) => {
       const launchMode = this.resolveLaunchMode(modeId, config.providerOptions);
-      const next = await this.resolveRuntime(config.providerOptions).startSession({
+      const next = await this.resolveRuntime(
+        config.providerOptions,
+        launchContext?.agentId,
+      ).startSession({
         ...startInput,
         model: config.model,
         thinkingOptionId: normalizeOmpThinkingOption(config.thinkingOptionId) ?? undefined,
@@ -2616,8 +2647,13 @@ export class OmpAgentClient implements AgentClient {
     return resolveOmpLaunchMode(modeId, resolveOmpProviderOptions(providerOptions).modelRoles);
   }
 
-  private resolveRuntime(providerOptions: Record<string, unknown> | undefined): OmpRuntime {
+  private resolveRuntime(
+    providerOptions: Record<string, unknown> | undefined,
+    actorId?: string,
+  ): OmpRuntime {
     const { runtimeOptions } = resolveOmpProviderOptions(providerOptions);
+    if (runtimeOptions.nativeSchemaObservation)
+      assertObservationActor(runtimeOptions.nativeSchemaObservation, actorId);
     return this.runtime ?? createRuntime(this.logger, this.runtimeSettings, runtimeOptions);
   }
 

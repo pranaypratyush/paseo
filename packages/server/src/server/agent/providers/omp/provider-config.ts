@@ -4,6 +4,10 @@ import { join, resolve } from "node:path";
 import { OMP_MODES } from "@getpaseo/protocol/provider-manifest";
 import { z } from "zod";
 
+import {
+  OmpNativeObservationOptionsSchema,
+  type OmpNativeObservationOptions,
+} from "./native-observation.js";
 import type { ProviderRuntimeSettings } from "../../provider-launch-config.js";
 
 const DEFAULT_OMP_MODE_ID = "full";
@@ -20,6 +24,7 @@ export const OmpProviderOptionsSchema = z
     smolModel: z.string().min(1).optional(),
     slowModel: z.string().min(1).optional(),
     planModel: z.string().min(1).optional(),
+    nativeSchemaObservation: OmpNativeObservationOptionsSchema.optional(),
   })
   .strict();
 
@@ -27,6 +32,7 @@ export interface OmpRuntimeOptions {
   sessionDir?: string;
   readyTimeoutMs: number;
   rpcTimeoutMs: number;
+  nativeSchemaObservation?: OmpNativeObservationOptions;
 }
 
 export interface OmpModelRoles {
@@ -139,6 +145,7 @@ export function resolveOmpProviderOptions(providerOptions: unknown): {
       sessionDir: options.sessionDir,
       readyTimeoutMs: configuredRpcTimeoutMs ?? DEFAULT_OMP_READY_TIMEOUT_MS,
       rpcTimeoutMs: configuredRpcTimeoutMs ?? DEFAULT_OMP_RPC_TIMEOUT_MS,
+      nativeSchemaObservation: options.nativeSchemaObservation,
     },
     modelRoles: {
       ...(options.smolModel ? { smolModel: options.smolModel } : {}),

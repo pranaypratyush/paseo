@@ -1,7 +1,16 @@
 import { describe, expect, test, vi } from "vitest";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { type Dirent, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  type Dirent,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -1102,6 +1111,171 @@ describe("Codex app-server provider", () => {
       },
     });
   });
+
+  test.skipIf(process.getuid === undefined).each(["matching", "other", "missing"])(
+    "binds the selected native-to-owner observation to the %s received terminal identity",
+    async (terminalIdentity) => {
+      const root = realpathSync(await mkdtemp(path.join(tmpdir(), "codex-turn-observation-")));
+      const output = path.join(root, "p1.json");
+      const actorId = "b093f388-d37e-4f87-b860-12631fbefb36";
+      const ownerClientMessageId = "399ea35e-e54a-4c35-bb87-61c11e1cb75b";
+      const appServer = createFakeCodexAppServer();
+      const session = await createProviderWithFakeAppServer(appServer).createSession(
+        createConfig({
+          providerOptions: {
+            nativeSchemaObservation: { actorId, ownerClientMessageId, path: output },
+          },
+        }),
+        { agentId: actorId },
+      );
+      const events: AgentStreamEvent[] = [];
+      session.subscribe((event) => events.push(event));
+      try {
+        const started = await session.startTurn("PRIVATE-PROMPT", {
+          clientMessageId: ownerClientMessageId,
+        });
+        await appServer.waitForTurnStart();
+        appServer.startsTurn({ threadId: "thread-1", turnId: "native-turn-17" });
+        appServer.child.stdout.write(
+          `${JSON.stringify({
+            method: "item/started",
+            params: {
+              threadId: "thread-1",
+              turnId: "native-turn-17",
+              item: {
+                type: "userMessage",
+                id: "native-user-17",
+                content: [{ type: "text", text: "PRIVATE-PROMPT" }],
+              },
+            },
+          })}\n`,
+        );
+        const terminal = Promise.withResolvers<void>();
+        const unsubscribe = session.subscribe((event) => {
+          if (event.type === "turn_completed") terminal.resolve();
+        });
+        appServer.child.stdout.write(
+          `${JSON.stringify({
+            method: "turn/completed",
+            params: {
+              threadId: "thread-1",
+              turn: {
+                status: "completed",
+                error: null,
+                ...(terminalIdentity === "missing"
+                  ? {}
+                  : { id: terminalIdentity === "other" ? "other-native-turn" : "native-turn-17" }),
+              },
+            },
+          })}\n`,
+        );
+        await terminal.promise;
+        unsubscribe();
+        if (terminalIdentity !== "matching") {
+          expect(existsSync(output)).toBe(false);
+          appServer.child.stdout.write(
+            `${JSON.stringify({
+              method: "turn/completed",
+              params: {
+                threadId: "thread-1",
+                turn: { id: "native-turn-17", status: "completed", error: null },
+              },
+            })}\n`,
+          );
+          expect(existsSync(output)).toBe(false);
+          appServer.assertNoErrors();
+          return;
+        }
+        const bytes = readFileSync(output, "utf8");
+        expect(JSON.parse(bytes)).toEqual({
+          format: "paseo.codex-turn-link.v1",
+          actorId,
+          ownerClientMessageId,
+          localProcessGeneration: expect.stringMatching(/^[0-9a-f-]{36}$/),
+          nativeSessionId: "thread-1",
+          nativeTurnId: "native-turn-17",
+          ownerTurnId: started.turnId,
+          nativeUserItemId: "native-user-17",
+        });
+        expect(bytes).not.toContain("PRIVATE-PROMPT");
+        expect(statSync(output).mode & 0o777).toBe(0o600);
+        const forwarded = appServer
+          .requests()
+          .filter(
+            (request) => request.method === "thread/start" || request.method === "turn/start",
+          );
+        expect(JSON.stringify(forwarded)).not.toContain("nativeSchemaObservation");
+        expect(JSON.stringify(forwarded)).not.toContain(output);
+        expect(events.find((event) => event.type === "turn_started")).toMatchObject({
+          turnId: started.turnId,
+        });
+        appServer.assertNoErrors();
+      } finally {
+        await session.close();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test("Codex observation selection cannot impersonate another enrollment actor", async () => {
+    const appServer = createFakeCodexAppServer();
+    await expect(
+      createProviderWithFakeAppServer(appServer).createSession(
+        createConfig({
+          providerOptions: {
+            nativeSchemaObservation: {
+              actorId: "b093f388-d37e-4f87-b860-12631fbefb36",
+              ownerClientMessageId: "399ea35e-e54a-4c35-bb87-61c11e1cb75b",
+              path: path.resolve("uncreated-observation.json"),
+            },
+          },
+        }),
+        { agentId: "3d124818-2d69-4898-ab2f-5be357ec2a80" },
+      ),
+    ).rejects.toThrow("actor does not match launch context");
+    expect(appServer.requests()).toEqual([]);
+  });
+
+  test.each(["other-thread", null])(
+    "does not certify a native start from %s as the selected owner",
+    async (threadId) => {
+      const root = realpathSync(await mkdtemp(path.join(tmpdir(), "codex-turn-mismatch-")));
+      const output = path.join(root, "p1.json");
+      const actorId = "b093f388-d37e-4f87-b860-12631fbefb36";
+      const ownerClientMessageId = "399ea35e-e54a-4c35-bb87-61c11e1cb75b";
+      const appServer = createFakeCodexAppServer();
+      const session = await createProviderWithFakeAppServer(appServer).createSession(
+        createConfig({
+          providerOptions: {
+            nativeSchemaObservation: { actorId, ownerClientMessageId, path: output },
+          },
+        }),
+        { agentId: actorId },
+      );
+      try {
+        await session.startTurn("PRIVATE-PROMPT", { clientMessageId: ownerClientMessageId });
+        await appServer.waitForTurnStart();
+        appServer.child.stdout.write(
+          `${JSON.stringify({
+            method: "turn/started",
+            params: { ...(threadId ? { threadId } : {}), turn: { id: "unowned-native" } },
+          })}\n`,
+        );
+        const terminal = Promise.withResolvers<void>();
+        const unsubscribe = session.subscribe((event) => {
+          if (event.type === "turn_completed") terminal.resolve();
+        });
+        appServer.completeTurn();
+        await terminal.promise;
+        unsubscribe();
+        expect(existsSync(output)).toBe(false);
+        appServer.assertNoErrors();
+      } finally {
+        await session.close();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   test("preserves cwd-resolved Codex writable roots under an explicit workflow mode", async () => {
     const appServer = createFakeCodexAppServer({

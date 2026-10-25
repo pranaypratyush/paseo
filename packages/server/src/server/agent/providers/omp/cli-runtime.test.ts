@@ -1,11 +1,31 @@
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import pino from "pino";
 import { describe, expect, test, vi } from "vitest";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { OmpCliRuntime } from "./cli-runtime.js";
-import type { OmpRuntimeLaunch } from "./runtime.js";
+import type { OmpRuntimeLaunch, OmpRuntimeSession } from "./runtime.js";
+import { writeNativeObservation } from "../native-observation.js";
+import { OmpAgentSession } from "./agent.js";
+import type { AgentStreamEvent } from "../../agent-sdk-types.js";
+import type { OmpRuntimeEvent } from "./rpc-types.js";
 
 type OmpChild = ChildProcessWithoutNullStreams & {
   stdin: PassThrough;
@@ -121,6 +141,588 @@ function withoutRequestId(command: Record<string, unknown>): Record<string, unkn
 }
 
 describe("OMP CLI runtime", () => {
+  test
+    .skipIf(process.platform !== "linux")
+    .each([
+      "conflict",
+      "terminal-first-conflict",
+      "fsync",
+      "local-conflict",
+      "local-delayed",
+      "success",
+    ])("selected qualified public turn retains terminal and custody on %s", async (condition) => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "omp-observation-failure-")));
+    const cwd = join(root, "repo");
+    const agentDir = join(root, "config");
+    const output = join(root, "selected.json");
+    for (const directory of [cwd, agentDir, join(root, "tmp")])
+      mkdirSync(directory, { mode: 0o700 });
+    for (const key of Object.keys(process.env)) {
+      if (
+        /^(OMP_|PI_|XDG_|GIT_|BUN_|NODE_|LD_|DYLD_|CLAUDE_CONFIG_DIR$|OPENCODE_CONFIG|WSL_)/.test(
+          key,
+        )
+      )
+        vi.stubEnv(key, undefined);
+    }
+    const child = createOmpChild();
+    const nativeName = "mcp_inbox_publish__publish_selected";
+    const local = condition.startsWith("local-");
+    const conflict = condition.endsWith("conflict");
+    const events: AgentStreamEvent[] = [];
+    const rawEvents: OmpRuntimeEvent[] = [];
+    const commands: string[] = [];
+    const terminal = Promise.withResolvers<void>();
+    const retry = Promise.withResolvers<void>();
+    let waiting = false;
+    let selectedPromptId: string | null = null;
+    const emitTerminal = (requestId: string) => {
+      child.stdout.write(
+        `${JSON.stringify({
+          type: "prompt_result",
+          id: requestId,
+          agentInvoked: !local,
+          status: "completed",
+          sessionSettled: true,
+        })}\n`,
+      );
+    };
+    replyToCommands(child, (command) => {
+      commands.push(String(command.type));
+      if (command.type === "set_host_tools") return { toolNames: [nativeName] };
+      if (command.type === "get_state")
+        return {
+          sessionId: "fresh-native",
+          isStreaming: false,
+          isCompacting: false,
+          messageCount: 0,
+          queuedMessageCount: 0,
+          hasPendingAsyncWork: false,
+          isSettled: true,
+          goal: null,
+          dumpTools: [{ name: nativeName, description: "Publish", parameters: { type: "object" } }],
+        };
+      if (command.type === "prompt") {
+        if (typeof command.id !== "string") throw new Error("Missing actual prompt RPC identity");
+        selectedPromptId = command.id;
+        if (condition === "terminal-first-conflict")
+          queueMicrotask(emitTerminal.bind(undefined, command.id));
+        return { agentInvoked: !local };
+      }
+      return {};
+    });
+    const runtime = new OmpCliRuntime({
+      logger: pino({ level: "silent" }),
+      command: [process.execPath],
+      spawnProcess: () => child,
+    });
+    let session: OmpRuntimeSession | undefined;
+    let agent: OmpAgentSession | undefined;
+    let restoreFsync: (() => void) | undefined;
+    try {
+      session = await runtime.startSession({
+        cwd,
+        env: { HOME: root, PI_CODING_AGENT_DIR: agentDir, TMPDIR: join(root, "tmp") },
+        extraArgs: ["--approval-mode", "yolo"],
+        nativeSchemaObservation: {
+          actorId: "b093f388-d37e-4f87-b860-12631fbefb36",
+          ownerClientMessageId: "399ea35e-e54a-4c35-bb87-61c11e1cb75b",
+          path: output,
+          tools: [{ server: "inbox_publish", tool: "publish" }],
+          qualificationRecipe: "omp-45c35e40-fresh-absence-v1",
+        },
+      });
+      await session.setHostTools([
+        {
+          name: nativeName,
+          description: "Publish",
+          parameters: { type: "object" },
+          loadMode: "essential",
+        },
+      ]);
+      session.nativeObservation?.setMappings(
+        new Map([[nativeName, { server: "inbox_publish", tool: "publish" }]]),
+      );
+      const initialState = await session.getState();
+      session.onEvent(rawEvents.push.bind(rawEvents));
+      agent = new OmpAgentSession({
+        runtimeSession: session,
+        initialState,
+        config: { provider: "omp", cwd },
+        logger: pino({ level: "silent" }),
+        restartRuntime: async () => {
+          throw new Error("Unexpected observation replay");
+        },
+        providerIdleScheduler: {
+          waitForRetry: () => {
+            waiting = true;
+            return retry.promise;
+          },
+        },
+      });
+      agent.subscribe((event) => {
+        events.push(event);
+        if (event.type === "turn_completed" || event.type === "turn_failed") terminal.resolve();
+      });
+      if (conflict) writeFileSync(output, "retained-original", { mode: 0o600 });
+      const prompt = vi.spyOn(session, "prompt");
+      const started = await agent.startTurn("PRIVATE-PROMPT", {
+        clientMessageId: "399ea35e-e54a-4c35-bb87-61c11e1cb75b",
+      });
+      const submitted = prompt.mock.results[0];
+      if (!submitted || submitted.type !== "return")
+        throw new Error("Actual prompt was not submitted");
+      if (condition === "terminal-first-conflict") {
+        await expect(submitted.value).rejects.toThrow();
+      } else {
+        const ack = await submitted.value;
+        if (!ack.requestId) throw new Error("Missing actual prompt RPC identity");
+        if (!local) {
+          child.stdout.write(`${JSON.stringify({ type: "agent_start" })}\n`);
+          child.stdout.write(
+            `${JSON.stringify({
+              type: "agent_end",
+              messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+            })}\n`,
+          );
+        }
+        await vi.waitFor(() => {
+          expect(events).not.toContainEqual(expect.objectContaining({ type: "turn_completed" }));
+          expect(waiting).toBe(true);
+        });
+        expect(commands.filter((command) => command === "get_state")).toEqual(["get_state"]);
+        if (condition === "fsync") {
+          const fsync = vi.spyOn(fs, "fsyncSync").mockImplementationOnce(() => {
+            throw new Error("PRIVATE-CUSTODY-ERROR");
+          });
+          syncBuiltinESMExports();
+          restoreFsync = () => {
+            fsync.mockRestore();
+            syncBuiltinESMExports();
+          };
+        }
+        emitTerminal(ack.requestId);
+      }
+      retry.resolve();
+      await terminal.promise;
+      expect(rawEvents).toContainEqual({
+        type: "prompt_result",
+        id: selectedPromptId,
+        status: "completed",
+        sessionSettled: true,
+        agentInvoked: !local,
+      });
+      if (conflict || condition === "fsync") {
+        expect(events).toContainEqual(
+          expect.objectContaining({ type: "turn_failed", turnId: started.turnId }),
+        );
+        expect(events).not.toContainEqual(expect.objectContaining({ type: "turn_completed" }));
+        expect(JSON.stringify(events)).not.toContain("PRIVATE-CUSTODY-ERROR");
+      } else {
+        expect(events).toContainEqual(
+          expect.objectContaining({ type: "turn_completed", turnId: started.turnId }),
+        );
+      }
+      const retained = readFileSync(output, "utf8");
+      if (conflict) expect(retained).toBe("retained-original");
+      else expect(JSON.parse(retained)).toMatchObject({ ownerTurnId: started.turnId });
+      const actualTerminal = rawEvents.find((event) => event.type === "prompt_result");
+      if (!actualTerminal) throw new Error("Actual terminal was dropped");
+      child.stdout.write(`${JSON.stringify(actualTerminal)}\n`);
+      expect(readFileSync(output, "utf8")).toBe(retained);
+      expect(commands.filter((command) => command === "prompt")).toEqual(["prompt"]);
+    } finally {
+      restoreFsync?.();
+      retry.resolve();
+      if (agent) await agent.close();
+      else await session?.close();
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test.skipIf(process.platform !== "linux").each(["stable", "invalidated", "before-ack"])(
+    "qualified consumer retains %s terminal facts without prompt/config/tool payloads",
+    async (condition) => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "omp-qualification-")));
+      const cwd = join(root, "repo");
+      const agentDir = join(root, "config");
+      const temporary = join(root, "tmp");
+      const output = join(root, "selected.json");
+      for (const path of [cwd, agentDir, temporary]) mkdirSync(path, { mode: 0o700 });
+      mkdirSync(join(cwd, ".git"));
+      for (const key of Object.keys(process.env)) {
+        if (
+          /^(OMP_|PI_|XDG_|GIT_|BUN_|NODE_|LD_|DYLD_|CLAUDE_CONFIG_DIR$|OPENCODE_CONFIG|WSL_)/.test(
+            key,
+          )
+        )
+          vi.stubEnv(key, undefined);
+      }
+      const child = createOmpChild();
+      const commands: string[] = [];
+      const nativeName = "mcp_inbox_publish__publish_selected";
+      const emitTerminal = (requestId: string) => {
+        child.stdout.write(`${JSON.stringify({ type: "agent_start" })}\n`);
+        for (let ordinal = 0; ordinal < 5; ordinal++) {
+          child.stdout.write(
+            `${JSON.stringify({ type: "tool_execution_start", toolCallId: `call-${ordinal}`, toolName: nativeName, args: { body: "PRIVATE-TOOL" } })}\n`,
+          );
+        }
+        if (condition === "invalidated") {
+          child.stdout.write(
+            `${JSON.stringify({ type: "tool_execution_start", toolCallId: "other-call", toolName: "other_native_tool", args: { body: "PRIVATE-OTHER" } })}\n`,
+          );
+        }
+        child.stdout.write(
+          `${JSON.stringify({ type: "prompt_result", id: requestId, agentInvoked: true, status: "completed", sessionSettled: true })}\n`,
+        );
+      };
+      replyToCommands(child, (command) => {
+        commands.push(String(command.type));
+        if (command.type === "set_host_tools") return { toolNames: [nativeName] };
+        if (command.type === "get_state")
+          return {
+            sessionId: "fresh-native",
+            isStreaming: false,
+            isCompacting: false,
+            messageCount: 0,
+            queuedMessageCount: 0,
+            hasPendingAsyncWork: false,
+            isSettled: true,
+            goal: null,
+            systemPrompt: "PRIVATE-STATE",
+            dumpTools: [
+              {
+                name: nativeName,
+                description: "Native publication",
+                parameters: { type: "object" },
+              },
+            ],
+          };
+        if (command.type === "prompt" && condition === "before-ack") {
+          const requestId = command.id;
+          if (typeof requestId !== "string") throw new Error("Missing actual prompt RPC identity");
+          queueMicrotask(emitTerminal.bind(undefined, requestId));
+        }
+        return {};
+      });
+      const runtime = new OmpCliRuntime({
+        logger: pino({ level: "silent" }),
+        command: [process.execPath],
+        spawnProcess: () => {
+          writeFileSync(join(agentDir, "agent.db"), "PRIVATE-DB");
+          writeFileSync(join(agentDir, "config.yml"), "PRIVATE-CONFIG");
+          return child;
+        },
+      });
+      let session: OmpRuntimeSession | undefined;
+      try {
+        session = await runtime.startSession({
+          cwd,
+          env: { HOME: root, PI_CODING_AGENT_DIR: agentDir, TMPDIR: temporary },
+          extraArgs: ["--approval-mode", "yolo"],
+          systemPrompt: "PRIVATE-APPEND",
+          nativeSchemaObservation: {
+            actorId: "b093f388-d37e-4f87-b860-12631fbefb36",
+            ownerClientMessageId: "399ea35e-e54a-4c35-bb87-61c11e1cb75b",
+            path: output,
+            tools: [{ server: "inbox_publish", tool: "publish" }],
+            qualificationRecipe: "omp-45c35e40-fresh-absence-v1",
+          },
+        });
+        await session.setHostTools([
+          {
+            name: nativeName,
+            description: "Publish",
+            parameters: { type: "object" },
+            loadMode: "essential",
+          },
+        ]);
+        session.nativeObservation?.setMappings(
+          new Map([[nativeName, { server: "inbox_publish", tool: "publish" }]]),
+        );
+        await session.getState();
+        session.nativeObservation?.selectOwnerTurn(
+          "actual-owner",
+          "399ea35e-e54a-4c35-bb87-61c11e1cb75b",
+        );
+        const ack = await session.prompt({ message: "PRIVATE-PROMPT" });
+        if (condition !== "before-ack") expect(existsSync(output)).toBe(false);
+        if (condition === "invalidated") {
+          await session.setAutoCompaction(false);
+          writeFileSync(join(agentDir, "config.yml"), "PRIVATE-CONFIG-WITH-CHANGE");
+          symlinkSync(agentDir, join(root, ".claude"));
+        }
+        if (!ack.requestId) throw new Error("Missing actual acknowledged RPC identity");
+        if (condition !== "before-ack") emitTerminal(ack.requestId);
+        await vi.waitFor(() =>
+          expect(JSON.parse(readFileSync(output, "utf8")).qualificationContext).toMatchObject({
+            recipe: "omp-45c35e40-fresh-absence-v1",
+            launch: {
+              home: root,
+              cwd,
+              agentDir,
+              tmpDir: temporary,
+              profile: "default",
+              approvalMode: "yolo",
+              extensionDiscovery: "enabled",
+            },
+            state: {
+              isStreaming: false,
+              queuedMessageCount: 0,
+              hasPendingAsyncWork: false,
+              isSettled: true,
+              goal: null,
+            },
+            activity: {
+              hostCommands:
+                condition === "invalidated" ? [{ type: "set_auto_compaction", count: 1 }] : [],
+              agentStarts: 1,
+              toolStarts: condition === "invalidated" ? 6 : 5,
+              nonSelectedToolStarts: condition === "invalidated" ? 1 : 0,
+              processExits: 0,
+              goalEvents: 0,
+              extensionUiRequests: 0,
+              prompts: 1,
+              ownerChanges: 0,
+              sessionTransitions: 0,
+            },
+            terminal: {
+              id: ack.requestId,
+              agentInvoked: true,
+              status: "completed",
+              sessionSettled: true,
+            },
+          }),
+        );
+        const bytes = readFileSync(output, "utf8");
+        const context = JSON.parse(bytes).qualificationContext;
+        expect(context.absence.beforeLaunch).toContainEqual({
+          path: join(agentDir, "agent.db"),
+          kind: "absent",
+        });
+        expect(
+          context.absence.atState.every((row: { kind: string }) => row.kind === "absent"),
+        ).toBe(true);
+        if (condition !== "invalidated") {
+          expect(context.absence.atTerminal).toEqual(context.absence.atState);
+          expect(context.configuration.atTerminal).toEqual(context.configuration.atState);
+        } else {
+          expect(context.absence.atTerminal).toContainEqual({
+            path: join(root, ".claude"),
+            kind: "symlink",
+          });
+          expect(context.configuration.atTerminal.size).not.toBe(
+            context.configuration.atState.size,
+          );
+        }
+        expect(context.configuration.atState).toMatchObject({
+          path: join(agentDir, "config.yml"),
+          kind: "file",
+        });
+        expect(bytes).not.toContain("PRIVATE-");
+        expect(commands).toEqual(
+          condition === "invalidated"
+            ? ["set_host_tools", "get_state", "prompt", "set_auto_compaction"]
+            : ["set_host_tools", "get_state", "prompt"],
+        );
+      } finally {
+        await session?.close();
+        vi.unstubAllEnvs();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test
+    .skipIf(process.platform !== "linux")
+    .each([
+      "legacy-db",
+      "dotenv",
+      "linked-contributor",
+      "unexpected-project-file",
+      "conflicting-selector",
+    ])("qualification rejects %s before the native process is spawned", async (kind) => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "omp-qualification-reject-")));
+    const cwd = join(root, "repo");
+    const agentDir = join(root, "config");
+    const temporary = join(root, "tmp");
+    for (const path of [cwd, agentDir, temporary]) mkdirSync(path, { mode: 0o700 });
+    for (const key of Object.keys(process.env)) {
+      if (
+        /^(OMP_|PI_|XDG_|GIT_|BUN_|NODE_|LD_|DYLD_|CLAUDE_CONFIG_DIR$|OPENCODE_CONFIG|WSL_)/.test(
+          key,
+        )
+      )
+        vi.stubEnv(key, undefined);
+    }
+    if (kind === "legacy-db") writeFileSync(join(agentDir, "agent.db"), "not read");
+    if (kind === "dotenv") writeFileSync(join(root, ".env"), "not read");
+    if (kind === "linked-contributor") symlinkSync(agentDir, join(root, ".claude"));
+    if (kind === "unexpected-project-file") writeFileSync(join(cwd, "module.js"), "not imported");
+    const spawnProcess = vi.fn(() => createOmpChild());
+    try {
+      const runtime = new OmpCliRuntime({
+        logger: pino({ level: "silent" }),
+        command: [process.execPath],
+        spawnProcess,
+      });
+      await expect(
+        runtime.startSession({
+          cwd,
+          env: {
+            HOME: root,
+            PI_CODING_AGENT_DIR: agentDir,
+            TMPDIR: temporary,
+            ...(kind === "conflicting-selector" ? { PI_CONFIG_DIR: ".unexpected" } : {}),
+          },
+          extraArgs: ["--approval-mode", "yolo"],
+          nativeSchemaObservation: {
+            actorId: "b093f388-d37e-4f87-b860-12631fbefb36",
+            ownerClientMessageId: "399ea35e-e54a-4c35-bb87-61c11e1cb75b",
+            path: join(root, "selected.json"),
+            tools: [{ server: "inbox_publish", tool: "publish" }],
+            qualificationRecipe: "omp-45c35e40-fresh-absence-v1",
+          },
+        }),
+      ).rejects.toThrow();
+      expect(spawnProcess).not.toHaveBeenCalled();
+      expect(existsSync(join(root, "selected.json"))).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test.skipIf(process.getuid === undefined)(
+    "observation custody rejects overwrite, symlink parents, public directories and oversized UTF-8",
+    () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "native-observation-custody-")));
+      try {
+        const output = join(root, "selected.json");
+        writeNativeObservation(output, { selected: "first" }, 1024);
+        expect(() => writeNativeObservation(output, { selected: "replacement" }, 1024)).toThrow();
+        expect(readFileSync(output, "utf8")).toBe('{"selected":"first"}\n');
+        const alias = join(root, "alias");
+        symlinkSync(root, alias);
+        expect(() => writeNativeObservation(join(alias, "aliased.json"), {}, 1024)).toThrow(
+          "symlink",
+        );
+        expect(existsSync(join(root, "aliased.json"))).toBe(false);
+        chmodSync(root, 0o755);
+        expect(() => writeNativeObservation(join(root, "public.json"), {}, 1024)).toThrow(
+          "private directory",
+        );
+        chmodSync(root, 0o700);
+        expect(() => writeNativeObservation(join(root, "oversized.json"), "é", 4)).toThrow(
+          "byte limit",
+        );
+        expect(existsSync(join(root, "oversized.json"))).toBe(false);
+      } finally {
+        chmodSync(root, 0o700);
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test.skipIf(process.getuid === undefined)(
+    "exports selected native schema and correlated RPC identities without private state or extra requests",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "omp-observation-")));
+      const output = join(root, "p1.json");
+      const child = createOmpChild();
+      const commands: string[] = [];
+      replyToCommands(child, (command) => {
+        commands.push(String(command.type));
+        if (command.type === "set_host_tools") return { toolNames: ["native_publish"] };
+        if (command.type === "prompt") return {};
+        return {
+          sessionId: "native-session",
+          isStreaming: false,
+          isCompacting: false,
+          messageCount: 0,
+          queuedMessageCount: 0,
+          systemPrompt: "PRIVATE-SYSTEM",
+          sessionFile: "PRIVATE-PATH",
+          queuedMessages: { steering: ["PRIVATE-QUEUE"] },
+          dumpTools: [
+            {
+              name: "native_publish",
+              description: "Native publication",
+              parameters: {
+                type: "object",
+                properties: { body: { type: "string", maxLength: 17 } },
+                additionalProperties: false,
+              },
+            },
+          ],
+        };
+      });
+      const session = await createRuntime(child).startSession({
+        cwd: "/workspace/project",
+        nativeSchemaObservation: {
+          actorId: "b093f388-d37e-4f87-b860-12631fbefb36",
+          ownerClientMessageId: "399ea35e-e54a-4c35-bb87-61c11e1cb75b",
+          path: output,
+          tools: [{ server: "inbox", tool: "publish" }],
+        },
+      });
+      try {
+        await session.setHostTools([
+          {
+            name: "native_publish",
+            description: "Input publication",
+            parameters: { type: "object" },
+            loadMode: "essential",
+          },
+        ]);
+        session.nativeObservation?.setMappings(
+          new Map([["native_publish", { server: "inbox", tool: "publish" }]]),
+        );
+        const state = await session.getState();
+        expect(state.systemPrompt).toBe("PRIVATE-SYSTEM");
+        if (!Array.isArray(state.dumpTools)) throw new Error("Expected native dumpTools");
+        Object.assign(state.dumpTools[0].parameters.properties.body, { maxLength: 999 });
+        session.nativeObservation?.selectOwnerTurn(
+          "owner-turn",
+          "399ea35e-e54a-4c35-bb87-61c11e1cb75b",
+        );
+        await session.prompt({ message: "PRIVATE-PROMPT" });
+        const bytes = readFileSync(output, "utf8");
+        const record = JSON.parse(bytes);
+        expect(record).toMatchObject({
+          format: "paseo.omp-active-state.v1",
+          observation: "native-active-state",
+          nativeSessionId: "native-session",
+          registrationRpcId: "req_1",
+          stateRpcId: "req_2",
+          promptRpcId: "req_3",
+          ownerTurnId: "owner-turn",
+          tools: [
+            {
+              name: "native_publish",
+              description: "Native publication",
+              parameters: {
+                type: "object",
+                properties: { body: { type: "string", maxLength: 17 } },
+                additionalProperties: false,
+              },
+            },
+          ],
+          mappings: [{ nativeName: "native_publish", server: "inbox", tool: "publish" }],
+        });
+        expect(record.localProcessGeneration).toMatch(/^[0-9a-f-]{36}$/);
+        expect(bytes).not.toContain("PRIVATE-");
+        expect(statSync(output).mode & 0o777).toBe(0o600);
+        expect(commands).toEqual(["set_host_tools", "get_state", "prompt"]);
+      } finally {
+        await session.close();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
   test("steer waits for OMP's response and surfaces rejection", async () => {
     const child = createOmpChild();
     let pending: Record<string, unknown> | null = null;

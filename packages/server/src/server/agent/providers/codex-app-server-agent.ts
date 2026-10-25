@@ -116,6 +116,8 @@ import {
   CodexProviderOptionsSchema,
   type CodexProviderOptions,
 } from "./codex/options.js";
+import { assertObservationActor } from "./native-observation.js";
+import { CodexNativeObservation } from "./codex/native-observation.js";
 
 function assertChildWithPipes(
   child: ChildProcess,
@@ -2543,6 +2545,7 @@ type ParsedCodexNotification =
       status: string;
       errorMessage: string | null;
       threadId: string | null;
+      turnId: string | null;
     }
   | {
       kind: "plan_updated";
@@ -2695,6 +2698,7 @@ const CodexNotificationSchema = z.union([
         status: params.turn.status,
         errorMessage: params.turn.error?.message ?? null,
         threadId: params.threadId ?? null,
+        turnId: params.turn.id ?? null,
       }),
     ),
   z.object({ method: z.literal("turn/completed"), params: z.unknown() }).transform(
@@ -3119,6 +3123,7 @@ const CodexNotificationSchema = z.union([
         status: "interrupted",
         errorMessage: null,
         threadId: getCodexEventThreadId(params),
+        turnId: null,
       }),
     ),
   z.object({ method: z.literal("codex/event/turn_aborted"), params: z.unknown() }).transform(
@@ -3139,6 +3144,7 @@ const CodexNotificationSchema = z.union([
         status: "completed",
         errorMessage: null,
         threadId: getCodexEventThreadId(params),
+        turnId: null,
       }),
     ),
   z.object({ method: z.literal("codex/event/task_complete"), params: z.unknown() }).transform(
@@ -3434,6 +3440,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   private currentMode: string;
   private hasWorkflowModeOverride: boolean;
   private readonly providerOptions: CodexProviderOptions;
+  private readonly nativeObservation?: CodexNativeObservation;
   private resolvedWorkspaceWrite: NonNullable<
     CodexProviderOptions["sandbox_workspace_write"]
   > | null = null;
@@ -3559,6 +3566,15 @@ export class CodexAppServerAgentSession implements AgentSession {
     this.currentMode = config.modeId ?? DEFAULT_CODEX_MODE_ID;
     this.providerOptions =
       validateProviderOptions("codex", CodexProviderOptionsSchema, config.providerOptions) ?? {};
+    if (
+      this.providerOptions.nativeSchemaObservation &&
+      this.initialResumePurpose === "interactive"
+    ) {
+      assertObservationActor(this.providerOptions.nativeSchemaObservation, this.agentId);
+      this.nativeObservation = new CodexNativeObservation(
+        this.providerOptions.nativeSchemaObservation,
+      );
+    }
     this.config = config;
     this.harnessEnvironment = deps.environment ?? buildCodexAppServerEnv();
     this.asyncQuestions = new CodexAsyncQuestions(resumeHandle?.metadata?.asyncQuestions);
@@ -3624,6 +3640,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       return;
     }
     const child = await this.spawnAppServer();
+    this.nativeObservation?.connected();
     const client = new CodexAppServerClient(child, this.logger, () => this.traceContext());
     if (this.closed) {
       await client.dispose();
@@ -4401,6 +4418,13 @@ export class CodexAppServerAgentSession implements AgentSession {
         promise: turnIdentification,
         resolve: resolveTurnIdentification,
       };
+      if (this.nativeObservation && this.currentThreadId) {
+        this.nativeObservation.selectOwnerTurn(
+          turnId,
+          options?.clientMessageId ?? null,
+          this.currentThreadId,
+        );
+      }
 
       this.logTurnStartSummary({
         turnId,
@@ -5349,7 +5373,12 @@ export class CodexAppServerAgentSession implements AgentSession {
 
   private buildCodexInnerConfig(): Record<string, unknown> | null {
     const innerConfig: Record<string, unknown> = {};
-    Object.assign(innerConfig, this.providerOptions);
+    if (this.providerOptions.nativeSchemaObservation) {
+      const { nativeSchemaObservation: _observation, ...nativeOptions } = this.providerOptions;
+      Object.assign(innerConfig, nativeOptions);
+    } else {
+      Object.assign(innerConfig, this.providerOptions);
+    }
     if (this.deps.customCodexConfig) {
       Object.assign(innerConfig, this.deps.customCodexConfig);
     }
@@ -6127,6 +6156,13 @@ export class CodexAppServerAgentSession implements AgentSession {
     }
     this.currentTurnId = parsed.turnId;
     const pendingIdentification = this.pendingForegroundTurnIdentification;
+    this.nativeObservation?.started(
+      parsed.threadId,
+      parsed.turnId,
+      pendingIdentification?.foregroundTurnId === this.activeForegroundTurnId
+        ? pendingIdentification.foregroundTurnId
+        : null,
+    );
     if (
       pendingIdentification &&
       pendingIdentification.foregroundTurnId === this.activeForegroundTurnId
@@ -6152,6 +6188,11 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.emitSubAgentActivityUpdate(subAgentCallId, status);
       return;
     }
+    this.nativeObservation?.completed(
+      parsed.threadId,
+      parsed.turnId,
+      parsed.status === "completed",
+    );
     this.completePendingRootCompactions();
     if (parsed.status === "failed") {
       this.emitEvent({
@@ -6820,6 +6861,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       return;
     }
     const clientMessageId = timelineItem.clientMessageId ?? this.activeClientMessageId;
+    this.nativeObservation?.userItem(parsed.threadId, parsed.turnId, clientMessageId, itemId);
     const item = clientMessageId ? { ...timelineItem, clientMessageId } : timelineItem;
     this.activeClientMessageId = null;
     this.emitEvent({ type: "timeline", provider: CODEX_PROVIDER, item });

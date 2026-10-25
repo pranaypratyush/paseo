@@ -13,6 +13,7 @@ import type {
   OmpThinkingLevel,
 } from "./rpc-types.js";
 import type { ProviderRuntimeSettings } from "../../provider-launch-config.js";
+import type { OmpNativeObservation, OmpNativeObservationOptions } from "./native-observation.js";
 
 export interface OmpRuntimeLaunch {
   cwd: string;
@@ -40,6 +41,7 @@ export interface OmpStartSessionInput {
   noSession?: boolean;
   systemPrompt?: string;
   extraArgs?: string[];
+  nativeSchemaObservation?: OmpNativeObservationOptions;
 }
 
 export interface OmpPromptInput {
@@ -50,6 +52,7 @@ export interface OmpPromptInput {
 
 export interface OmpRuntimeSession {
   readonly environment: Record<string, string>;
+  readonly nativeObservation?: OmpNativeObservation;
   onEvent(callback: (event: OmpRuntimeEvent) => void): () => void;
   // With streamingBehavior, a busy OMP queues the message instead of rejecting it, and an
   // idle OMP starts a run with it.

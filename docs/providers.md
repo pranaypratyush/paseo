@@ -34,6 +34,45 @@ Exact MCP preapproval is a separate daemon-owned contract. A new provider must f
 closed for Hub unattended execution until it can approve one exact injected MCP
 server and tool identity without approving native tools.
 
+### Scoped native qualification observations
+
+`providerOptions.nativeSchemaObservation` is host-owned and disabled unless one
+agent explicitly selects an output path and owner client-message ID. Bind its
+actor to `launchContext.agentId`; never enable it through provider defaults,
+environment variables, history hydration or catalog probes. Codex strips this
+option before constructing native configuration. It does not enable native tracing.
+
+Use a fresh canonical path inside an owned private POSIX directory. Observation
+writes are exclusive; keep failed or partial outputs. Complete JSON can remain
+after a failed fsync: a failed selected OMP host turn or missing terminal leaves
+qualification unknown even when the retained file parses. Do not delete it and
+retry the turn.
+
+OMP retains only selected native `get_state` tool definitions from an existing
+response, with host registration/state/prompt correlations. Do not persist the
+whole response: it can contain system prompts, queue contents and session paths.
+Codex retains only the received native-to-owner turn link. Older ID-less terminal
+events can settle an ordinary turn but cannot certify an observation. Process
+generations are recorder-local, not native epochs. Neither receipt proves the
+final inference payload. Bind native executable provenance and same-turn ownership
+separately.
+
+OMP's optional `qualificationRecipe: "omp-45c35e40-fresh-absence-v1"` supports
+one source-reviewed fresh layout, not existing profiles. Its actual launch must
+use a private `HOME` with distinct direct-child project and agent directories;
+`PI_CODING_AGENT_DIR` selects the latter. Prepare credentials separately through
+the provider's supported environment: an existing auth/settings database cannot
+pass the fresh-profile check. The option never clears environment variables,
+changes approval policy or injects native flags.
+
+The same receipt gains `qualificationContext` only after the selected native
+prompt's correlated terminal. It retains metadata and scoped activity, never
+configuration contents. The recipe commit identifies the reviewed discovery
+rules, not an observed native build. A campaign must validate contributor
+absence, configuration stability and relevant invalidators against that source
+and its independently admitted launch. Metadata cannot exclude hostile transient
+writes; keep the fresh qualification roots under closed ownership.
+
 ## Core adapter patterns
 
 ### ACP (Agent Client Protocol) -- recommended

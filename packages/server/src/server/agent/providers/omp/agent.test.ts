@@ -39,6 +39,27 @@ const ABORTED_TERMINAL_RESPONSE: OmpAgentMessage = {
   errorMessage: "Interrupted by user",
 };
 
+test("OMP observation selection cannot impersonate another enrollment actor", async () => {
+  const client = new OmpAgentClient({ logger: createTestLogger(), runtime: new FakeOmp() });
+  await expect(
+    client.createSession(
+      {
+        provider: "omp",
+        cwd: process.cwd(),
+        providerOptions: {
+          nativeSchemaObservation: {
+            actorId: "b093f388-d37e-4f87-b860-12631fbefb36",
+            ownerClientMessageId: "399ea35e-e54a-4c35-bb87-61c11e1cb75b",
+            path: path.resolve("uncreated-observation.json"),
+            tools: [{ server: "inbox_publish", tool: "publish" }],
+          },
+        },
+      },
+      { agentId: "3d124818-2d69-4898-ab2f-5be357ec2a80" },
+    ),
+  ).rejects.toThrow("actor does not match launch context");
+});
+
 test("an idle follow-up is submitted as a prompt so OMP can start a turn", async () => {
   const runtime = new FakeOmp();
   const client = new OmpAgentClient({ logger: createTestLogger(), runtime });
